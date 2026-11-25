@@ -11,8 +11,10 @@
 # App Store Connect API key with the Admin role, which automatic signing
 # needs) and APPLE_TEAM_ID.
 #
-# These logs are public: the Xcode log goes to a file and only its error lines
-# are printed, and nothing is uploaded as an artifact.
+# These logs are public. Xcode's log goes to a file and only its error lines
+# are printed (or its last lines, if none match), and nothing is uploaded as an
+# artifact. A failed build's errors can still quote private file paths and
+# source lines, as release.yml's do; secrets never appear.
 name: iOS
 
 on:
@@ -29,6 +31,10 @@ on:
 
 permissions:
   contents: read
+
+defaults:
+  run:
+    shell: bash # -eo pipefail; GitHub's default for `run` has no pipefail
 
 concurrency:
   group: ios
@@ -49,11 +55,14 @@ jobs:
         env:
           REF: ${{ inputs.ref }}
           UPLOAD: ${{ inputs.upload }}
+          ATTEMPT: ${{ github.run_attempt }}
         run: |
+          tag='^ios-v[0-9]+\.[0-9]+\.[0-9]+$'
+          [[ "$REF" =~ $tag || "$REF" =~ ^(main|[0-9a-f]{40})$ ]] || { echo "::error::ref must be main, a full SHA or ios-vX.Y.Z"; exit 1; }
           if [ "$UPLOAD" = true ]; then
-            [[ "$REF" =~ ^ios-v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::uploads build an ios-vX.Y.Z tag"; exit 1; }
-          else
-            [[ "$REF" =~ ^(main|[0-9a-f]{40}|ios-v[0-9]+\.[0-9]+\.[0-9]+)$ ]] || { echo "::error::ref must be main, a full SHA or ios-vX.Y.Z"; exit 1; }
+            [[ "$REF" =~ $tag ]] || { echo "::error::uploads build an ios-vX.Y.Z tag"; exit 1; }
+            # A re-run keeps the run number, which App Store Connect has seen.
+            [ "$ATTEMPT" = 1 ] || { echo "::error::re-run uploads reuse the build number; use release-ios.sh --resume"; exit 1; }
           fi
 
       - name: Apple secrets are set
@@ -72,6 +81,19 @@ jobs:
 
       - name: Xcode
         run: |
+          # xc <name> <xcodebuild args…>: the full log goes to a file; on
+          # failure, only its error lines (or its last lines) are printed.
+          cat > "$RUNNER_TEMP/xc.sh" <<'SH'
+          xc() {
+            local log="$RUNNER_TEMP/$1.log" errors
+            shift
+            xcodebuild "$@" > "$log" 2>&1 && return 0
+            errors=$(grep -E "error:|\*\* [A-Z]+ FAILED|Command .* failed" "$log" | head -80 || true)
+            if [ -n "$errors" ]; then echo "$errors"; else tail -30 "$log"; fi
+            return 1
+          }
+          SH
+          echo "ASC_KEY_PATH=$RUNNER_TEMP/asc/AuthKey.p8" >> "$GITHUB_ENV"
           if [ ! -d "$XCODE" ]; then
             echo "::error::$XCODE isn't on this image; installed:"; ls -d /Applications/Xcode* ; exit 1
           fi
@@ -117,13 +139,10 @@ jobs:
         if: ${{ !inputs.upload }}
         working-directory: mobile
         run: |
-          xcodebuild -workspace "$WORKSPACE" -scheme "$SCHEME" -configuration Release \
+          . "$RUNNER_TEMP/xc.sh"
+          xc build -workspace "$WORKSPACE" -scheme "$SCHEME" -configuration Release \
             -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
-            -derivedDataPath "$RUNNER_TEMP/dd" CODE_SIGNING_ALLOWED=NO build \
-            > "$RUNNER_TEMP/xcode.log" 2>&1 || {
-              grep -E "error:|\*\* BUILD FAILED|Command .* failed" "$RUNNER_TEMP/xcode.log" | head -80 || tail -30 "$RUNNER_TEMP/xcode.log"
-              exit 1
-            }
+            -derivedDataPath "$RUNNER_TEMP/dd" CODE_SIGNING_ALLOWED=NO build
           ls -d "$RUNNER_TEMP"/dd/Build/Products/Release-iphonesimulator/*.app
 
       - name: Signed archive
@@ -135,18 +154,14 @@ jobs:
           ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
-          key="$RUNNER_TEMP/asc/AuthKey.p8"
-          mkdir -m 700 "$RUNNER_TEMP/asc"
-          (umask 077 && printf '%s\n' "$ASC_KEY_P8" > "$key")
-          auth=(-allowProvisioningUpdates -authenticationKeyPath "$key"
-                -authenticationKeyID "$ASC_KEY_ID" -authenticationKeyIssuerID "$ASC_ISSUER_ID")
-          xcodebuild -workspace "$WORKSPACE" -scheme "$SCHEME" -configuration Release \
+          . "$RUNNER_TEMP/xc.sh"
+          mkdir -m 700 "$(dirname "$ASC_KEY_PATH")"
+          (umask 077 && printf '%s\n' "$ASC_KEY_P8" > "$ASC_KEY_PATH")
+          xc archive -workspace "$WORKSPACE" -scheme "$SCHEME" -configuration Release \
             -destination 'generic/platform=iOS' -archivePath "$RUNNER_TEMP/app.xcarchive" \
-            "${auth[@]}" DEVELOPMENT_TEAM="$APPLE_TEAM_ID" CODE_SIGN_STYLE=Automatic archive \
-            > "$RUNNER_TEMP/xcode.log" 2>&1 || {
-              grep -E "error:|\*\* ARCHIVE FAILED|Command .* failed" "$RUNNER_TEMP/xcode.log" | head -80 || tail -30 "$RUNNER_TEMP/xcode.log"
-              exit 1
-            }
+            -allowProvisioningUpdates -authenticationKeyPath "$ASC_KEY_PATH" \
+            -authenticationKeyID "$ASC_KEY_ID" -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
+            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" CODE_SIGN_STYLE=Automatic archive
 
       - name: Upload to TestFlight
         if: inputs.upload
@@ -155,6 +170,7 @@ jobs:
           ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
+          . "$RUNNER_TEMP/xc.sh"
           plist="$RUNNER_TEMP/ExportOptions.plist"
           cat > "$plist" <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
@@ -168,16 +184,12 @@ jobs:
             <key>manageAppVersionAndBuildNumber</key><false/>
           </dict></plist>
           EOF
-          xcodebuild -exportArchive -archivePath "$RUNNER_TEMP/app.xcarchive" \
+          xc export -exportArchive -archivePath "$RUNNER_TEMP/app.xcarchive" \
             -exportOptionsPlist "$plist" -exportPath "$RUNNER_TEMP/export" \
-            -allowProvisioningUpdates -authenticationKeyPath "$RUNNER_TEMP/asc/AuthKey.p8" \
-            -authenticationKeyID "$ASC_KEY_ID" -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
-            > "$RUNNER_TEMP/export.log" 2>&1 || {
-              grep -iE "error|fail" "$RUNNER_TEMP/export.log" | head -60
-              exit 1
-            }
-          echo "uploaded build $IOS_BUILD_NUMBER; it shows in TestFlight once Apple has processed it"
+            -allowProvisioningUpdates -authenticationKeyPath "$ASC_KEY_PATH" \
+            -authenticationKeyID "$ASC_KEY_ID" -authenticationKeyIssuerID "$ASC_ISSUER_ID"
+          echo "uploaded build $IOS_BUILD_NUMBER"
 
       - name: Remove the Apple key
         if: always()
-        run: rm -rf "$RUNNER_TEMP/asc"
+        run: rm -rf "$(dirname "$ASC_KEY_PATH")"
