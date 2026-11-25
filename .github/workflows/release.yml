@@ -1,0 +1,86 @@
+# Build and publish splitchat for Linux (splitchat D51).
+#
+# Runs only by hand: `gh workflow run release.yml -R stackedtensor/splitchat-releases -f ref=desktop-v0.1.0`
+# (the hub's infra/scripts/splitchat/release-desktop.sh does this). The private
+# source is read with a read-only deploy key; the release, its .deb/.rpm/
+# AppImage, their signatures and latest.json land in this public repo.
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "splitchat source ref to build (a desktop-v* tag)"
+        required: true
+
+permissions:
+  contents: write # create the release here
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  linux:
+    # 22.04: the oldest glibc we support; the result runs on newer distros too.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - name: Check the ref is a release tag
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          [[ "$REF" =~ ^desktop-v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "ref must be desktop-vX.Y.Z"; exit 1; }
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: stackedtensor/splitchat
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: System libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
+            librsvg2-dev libdbus-1-dev libxdo-dev patchelf
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            web/package-lock.json
+            desktop/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: desktop/src-tauri -> target
+
+      - name: Install JS dependencies
+        run: |
+          npm ci --prefix web --no-audit --no-fund
+          npm ci --prefix desktop --no-audit --no-fund
+
+      - name: Version matches the tag
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          v=$(jq -r .version desktop/src-tauri/tauri.conf.json)
+          [ "desktop-v$v" = "$REF" ] || { echo "tauri.conf.json says $v, tag is $REF"; exit 1; }
+
+      - uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # action-v1.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: desktop
+          tagName: v__VERSION__
+          releaseName: splitchat __VERSION__
+          releaseBody: "Linux packages. The AppImage updates itself; .deb and .rpm installs update from this page. See the README for install notes."
+          releaseDraft: false
+          prerelease: false
+          uploadUpdaterJson: true
